@@ -51,6 +51,10 @@ from agent.retry_utils import jittered_backoff
 # Load .env from HERMES_HOME first, then project root as a dev fallback.
 from hermes_cli.env_loader import load_hermes_dotenv
 
+
+logger = logging.getLogger(__name__)
+
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 _hermes_home = get_hermes_home()
 _project_env = Path(__file__).parent / ".env"
 load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env)
@@ -79,103 +83,159 @@ def _effective_temperature_for_model(
     return requested_temperature
 
 
+
 @dataclass
 class CompressionConfig:
     """Configuration for trajectory compression."""
+
     # Tokenizer
     tokenizer_name: str = "moonshotai/Kimi-K2-Thinking"
     trust_remote_code: bool = True
-    
+
     # Compression targets
     target_max_tokens: int = 15250
     summary_target_tokens: int = 750
-    
+
     # Protected turns
     protect_first_system: bool = True
     protect_first_human: bool = True
     protect_first_gpt: bool = True
     protect_first_tool: bool = True
     protect_last_n_turns: int = 4
-    
-    # Summarization (OpenRouter)
-    summarization_model: str = "google/gemini-3-flash-preview"
+
+    # ✅ FIX 1: Use stable default model
+    summarization_model: str = "google/gemini-1.5-flash"
+
     base_url: str = OPENROUTER_BASE_URL
     api_key_env: str = "OPENROUTER_API_KEY"
     temperature: float = 0.3
     max_retries: int = 3
     retry_delay: int = 2
-    
+
     # Output
     add_summary_notice: bool = True
-    summary_notice_text: str = "\n\nSome of your previous tool responses may be summarized to preserve context."
+    summary_notice_text: str = (
+        "\n\nSome of your previous tool responses may be summarized "
+        "to preserve context."
+    )
     output_suffix: str = "_compressed"
-    
+
     # Processing
     num_workers: int = 4
-    max_concurrent_requests: int = 50  # Max concurrent API calls for summarization
+    max_concurrent_requests: int = 50
     skip_under_target: bool = True
     save_over_limit: bool = True
-    per_trajectory_timeout: int = 300  # Timeout per trajectory in seconds (default: 5 min)
-    
+    per_trajectory_timeout: int = 300
+
     # Metrics
     metrics_enabled: bool = True
     metrics_per_trajectory: bool = True
     metrics_output_file: str = "compression_metrics.json"
-    
+
     @classmethod
     def from_yaml(cls, yaml_path: str) -> "CompressionConfig":
-        """Load configuration from YAML file."""
-        with open(yaml_path, 'r', encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
+        """Load configuration from YAML file safely."""
+        try:
+            with open(yaml_path, "r", encoding="utf-8") as f:
+                data: Dict[str, Any] = yaml.safe_load(f) or {}
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Config file not found: {yaml_path}")
+        except yaml.YAMLError as e:
+            raise ValueError(f"Invalid YAML format: {e}")
 
         config = cls()
 
+        def get_section(section: str):
+            value = data.get(section, {})
+            if not isinstance(value, dict):
+                logger.warning(f"Ignoring invalid config section: {section}")
+                return {}
+            return value
+
         # Tokenizer
-        if 'tokenizer' in data:
-            config.tokenizer_name = data['tokenizer'].get('name', config.tokenizer_name)
-            config.trust_remote_code = data['tokenizer'].get('trust_remote_code', config.trust_remote_code)
-        
+        tok = get_section("tokenizer")
+        config.tokenizer_name = tok.get("name", config.tokenizer_name)
+        config.trust_remote_code = tok.get(
+            "trust_remote_code", config.trust_remote_code
+        )
+
         # Compression
-        if 'compression' in data:
-            config.target_max_tokens = data['compression'].get('target_max_tokens', config.target_max_tokens)
-            config.summary_target_tokens = data['compression'].get('summary_target_tokens', config.summary_target_tokens)
-        
+        comp = get_section("compression")
+        config.target_max_tokens = comp.get(
+            "target_max_tokens", config.target_max_tokens
+        )
+        config.summary_target_tokens = comp.get(
+            "summary_target_tokens", config.summary_target_tokens
+        )
+
         # Protected turns
-        if 'protected_turns' in data:
-            config.protect_first_system = data['protected_turns'].get('first_system', config.protect_first_system)
-            config.protect_first_human = data['protected_turns'].get('first_human', config.protect_first_human)
-            config.protect_first_gpt = data['protected_turns'].get('first_gpt', config.protect_first_gpt)
-            config.protect_first_tool = data['protected_turns'].get('first_tool', config.protect_first_tool)
-            config.protect_last_n_turns = data['protected_turns'].get('last_n_turns', config.protect_last_n_turns)
-        
+        pt = get_section("protected_turns")
+        config.protect_first_system = pt.get("first_system", config.protect_first_system)
+        config.protect_first_human = pt.get("first_human", config.protect_first_human)
+        config.protect_first_gpt = pt.get("first_gpt", config.protect_first_gpt)
+        config.protect_first_tool = pt.get("first_tool", config.protect_first_tool)
+        config.protect_last_n_turns = pt.get(
+            "last_n_turns", config.protect_last_n_turns
+        )
+
         # Summarization
-        if 'summarization' in data:
-            config.summarization_model = data['summarization'].get('model', config.summarization_model)
-            config.base_url = data['summarization'].get('base_url') or config.base_url
-            config.api_key_env = data['summarization'].get('api_key_env', config.api_key_env)
-            config.temperature = data['summarization'].get('temperature', config.temperature)
-            config.max_retries = data['summarization'].get('max_retries', config.max_retries)
-            config.retry_delay = data['summarization'].get('retry_delay', config.retry_delay)
-        
+        summ = get_section("summarization")
+        config.summarization_model = summ.get(
+            "model", config.summarization_model
+        )
+        config.base_url = summ.get("base_url") or config.base_url
+        config.api_key_env = summ.get("api_key_env", config.api_key_env)
+        config.temperature = summ.get("temperature", config.temperature)
+        config.max_retries = summ.get("max_retries", config.max_retries)
+        config.retry_delay = summ.get("retry_delay", config.retry_delay)
+
+        # ✅ FIX 2: Warn if using preview model
+        if "preview" in config.summarization_model:
+            logger.warning(
+                f"Using preview model '{config.summarization_model}'. "
+                "This may be unstable in production."
+            )
+
         # Output
-        if 'output' in data:
-            config.add_summary_notice = data['output'].get('add_summary_notice', config.add_summary_notice)
-            config.summary_notice_text = data['output'].get('summary_notice_text', config.summary_notice_text)
-            config.output_suffix = data['output'].get('output_suffix', config.output_suffix)
-        
+        out = get_section("output")
+        config.add_summary_notice = out.get(
+            "add_summary_notice", config.add_summary_notice
+        )
+        config.summary_notice_text = out.get(
+            "summary_notice_text", config.summary_notice_text
+        )
+        config.output_suffix = out.get(
+            "output_suffix", config.output_suffix
+        )
+
         # Processing
-        if 'processing' in data:
-            config.num_workers = data['processing'].get('num_workers', config.num_workers)
-            config.max_concurrent_requests = data['processing'].get('max_concurrent_requests', config.max_concurrent_requests)
-            config.skip_under_target = data['processing'].get('skip_under_target', config.skip_under_target)
-            config.save_over_limit = data['processing'].get('save_over_limit', config.save_over_limit)
-        
+        proc = get_section("processing")
+        config.num_workers = proc.get("num_workers", config.num_workers)
+        config.max_concurrent_requests = proc.get(
+            "max_concurrent_requests", config.max_concurrent_requests
+        )
+        config.skip_under_target = proc.get(
+            "skip_under_target", config.skip_under_target
+        )
+        config.save_over_limit = proc.get(
+            "save_over_limit", config.save_over_limit
+        )
+
+        # ✅ FIX 3: Missing field in original YAML parsing (bug)
+        config.per_trajectory_timeout = proc.get(
+            "per_trajectory_timeout", config.per_trajectory_timeout
+        )
+
         # Metrics
-        if 'metrics' in data:
-            config.metrics_enabled = data['metrics'].get('enabled', config.metrics_enabled)
-            config.metrics_per_trajectory = data['metrics'].get('per_trajectory', config.metrics_per_trajectory)
-            config.metrics_output_file = data['metrics'].get('output_file', config.metrics_output_file)
-        
+        met = get_section("metrics")
+        config.metrics_enabled = met.get("enabled", config.metrics_enabled)
+        config.metrics_per_trajectory = met.get(
+            "per_trajectory", config.metrics_per_trajectory
+        )
+        config.metrics_output_file = met.get(
+            "output_file", config.metrics_output_file
+        )
+
         return config
 
 
